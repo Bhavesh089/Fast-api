@@ -9,9 +9,9 @@ from pydantic import BaseModel
 app = FastAPI()
 
 
-@app.post("/Body")
-async def someMethod(body: dict):
+@app.get("/Body")
+def someMethod(body: dict):
     fileName = 'Response_data.json'
     with open(fileName, "w+") as write_file:
         json.dump(body,write_file)
-    return fileName
+    return {'hello':'world'}
