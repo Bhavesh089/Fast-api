@@ -1,4 +1,5 @@
 import asyncio
+import logging
 
 STATE_TRANSITION_ERROR = "Got invalid state transition on lifespan protocol."
 
@@ -9,7 +10,7 @@ class LifespanOn:
             config.load()
 
         self.config = config
-        self.logger = config.logger_instance
+        self.logger = logging.getLogger("uvicorn.error")
         self.startup_event = asyncio.Event()
         self.shutdown_event = asyncio.Event()
         self.receive_queue = asyncio.Queue()
@@ -29,6 +30,8 @@ class LifespanOn:
         if self.startup_failed or (self.error_occured and self.config.lifespan == "on"):
             self.logger.error("Application startup failed. Exiting.")
             self.should_exit = True
+        else:
+            self.logger.info("Application startup complete.")
 
     async def shutdown(self):
         if self.error_occured:
@@ -36,6 +39,7 @@ class LifespanOn:
         self.logger.info("Waiting for application shutdown.")
         await self.receive_queue.put({"type": "lifespan.shutdown"})
         await self.shutdown_event.wait()
+        self.logger.info("Application shutdown complete.")
 
     async def main(self):
         try:

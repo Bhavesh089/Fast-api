@@ -1,10 +1,14 @@
 import asyncio
 import inspect
 import logging
+import logging.config
+import os
 import socket
 import ssl
 import sys
 from typing import List, Tuple
+
+import click
 
 from uvicorn.importer import ImportFromStringError, import_from_string
 from uvicorn.middleware.asgi2 import ASGI2Middleware
@@ -13,12 +17,15 @@ from uvicorn.middleware.message_logger import MessageLoggerMiddleware
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 from uvicorn.middleware.wsgi import WSGIMiddleware
 
+TRACE_LOG_LEVEL = 5
+
 LOG_LEVELS = {
     "critical": logging.CRITICAL,
     "error": logging.ERROR,
     "warning": logging.WARNING,
     "info": logging.INFO,
     "debug": logging.DEBUG,
+    "trace": TRACE_LOG_LEVEL,
 }
 HTTP_PROTOCOLS = {
     "auto": "uvicorn.protocols.http.auto:AutoHTTPProtocol",
@@ -26,8 +33,8 @@ HTTP_PROTOCOLS = {
     "httptools": "uvicorn.protocols.http.httptools_impl:HttpToolsProtocol",
 }
 WS_PROTOCOLS = {
-    "none": None,
     "auto": "uvicorn.protocols.websockets.auto:AutoWebSocketsProtocol",
+    "none": None,
     "websockets": "uvicorn.protocols.websockets.websockets_impl:WebSocketProtocol",
     "wsproto": "uvicorn.protocols.websockets.wsproto_impl:WSProtocol",
 }
@@ -37,23 +44,52 @@ LIFESPAN = {
     "off": "uvicorn.lifespan.off:LifespanOff",
 }
 LOOP_SETUPS = {
+    "none": None,
     "auto": "uvicorn.loops.auto:auto_loop_setup",
     "asyncio": "uvicorn.loops.asyncio:asyncio_setup",
     "uvloop": "uvicorn.loops.uvloop:uvloop_setup",
 }
 INTERFACES = ["auto", "asgi3", "asgi2", "wsgi"]
 
+
 # Fallback to 'ssl.PROTOCOL_SSLv23' in order to support Python < 3.5.3.
 SSL_PROTOCOL_VERSION = getattr(ssl, "PROTOCOL_TLS", ssl.PROTOCOL_SSLv23)
 
 
-def get_logger(log_level):
-    if isinstance(log_level, str):
-        log_level = LOG_LEVELS[log_level]
-    logging.basicConfig(format="%(levelname)s: %(message)s", level=log_level)
-    logger = logging.getLogger("uvicorn")
-    logger.setLevel(log_level)
-    return logger
+LOGGING_CONFIG = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "default": {
+            "()": "uvicorn.logging.DefaultFormatter",
+            "fmt": "%(levelprefix)s %(message)s",
+            "use_colors": None,
+        },
+        "access": {
+            "()": "uvicorn.logging.AccessFormatter",
+            "fmt": '%(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s',
+        },
+    },
+    "handlers": {
+        "default": {
+            "formatter": "default",
+            "class": "logging.StreamHandler",
+            "stream": "ext://sys.stderr",
+        },
+        "access": {
+            "formatter": "access",
+            "class": "logging.StreamHandler",
+            "stream": "ext://sys.stdout",
+        },
+    },
+    "loggers": {
+        "": {"handlers": ["default"], "level": "INFO"},
+        "uvicorn.error": {"level": "INFO"},
+        "uvicorn.access": {"handlers": ["access"], "level": "INFO", "propagate": False},
+    },
+}
+
+logger = logging.getLogger("uvicorn.error")
 
 
 def create_ssl_context(certfile, keyfile, ssl_version, cert_reqs, ca_certs, ciphers):
@@ -79,18 +115,22 @@ class Config:
         http="auto",
         ws="auto",
         lifespan="auto",
-        log_level="info",
-        logger=None,
+        env_file=None,
+        log_config=LOGGING_CONFIG,
+        log_level=None,
         access_log=True,
+        use_colors=None,
         interface="auto",
         debug=False,
         reload=False,
         reload_dirs=None,
-        workers=1,
-        proxy_headers=False,
+        workers=None,
+        proxy_headers=True,
+        forwarded_allow_ips=None,
         root_path="",
         limit_concurrency=None,
         limit_max_requests=None,
+        backlog=2048,
         timeout_keep_alive=5,
         timeout_notify=30,
         callback_notify=None,
@@ -111,17 +151,19 @@ class Config:
         self.http = http
         self.ws = ws
         self.lifespan = lifespan
+        self.log_config = log_config
         self.log_level = log_level
-        self.logger = logger
         self.access_log = access_log
+        self.use_colors = use_colors
         self.interface = interface
         self.debug = debug
         self.reload = reload
-        self.workers = workers
+        self.workers = workers or 1
         self.proxy_headers = proxy_headers
         self.root_path = root_path
         self.limit_concurrency = limit_concurrency
         self.limit_max_requests = limit_max_requests
+        self.backlog = backlog
         self.timeout_keep_alive = timeout_keep_alive
         self.timeout_notify = timeout_notify
         self.callback_notify = callback_notify
@@ -134,16 +176,76 @@ class Config:
         self.headers = headers if headers else []  # type: List[str]
         self.encoded_headers = None  # type: List[Tuple[bytes, bytes]]
 
+        self.loaded = False
+        self.configure_logging()
+
         if reload_dirs is None:
-            self.reload_dirs = sys.path
+            self.reload_dirs = [os.getcwd()]
         else:
             self.reload_dirs = reload_dirs
 
-        self.loaded = False
+        if env_file is not None:
+            from dotenv import load_dotenv
+
+            logger.info("Loading environment from '%s'", env_file)
+            load_dotenv(dotenv_path=env_file)
+
+        if workers is None and "WEB_CONCURRENCY" in os.environ:
+            self.workers = int(os.environ["WEB_CONCURRENCY"])
+
+        if forwarded_allow_ips is None:
+            self.forwarded_allow_ips = os.environ.get(
+                "FORWARDED_ALLOW_IPS", "127.0.0.1"
+            )
+        else:
+            self.forwarded_allow_ips = forwarded_allow_ips
 
     @property
     def is_ssl(self) -> bool:
         return bool(self.ssl_keyfile or self.ssl_certfile)
+
+    def configure_logging(self):
+        logging.addLevelName(TRACE_LOG_LEVEL, "TRACE")
+
+        if sys.version_info < (3, 7):
+            # https://bugs.python.org/issue30520
+            import pickle
+
+            def __reduce__(self):
+                if isinstance(self, logging.RootLogger):
+                    return logging.getLogger, ()
+
+                if logging.getLogger(self.name) is not self:
+                    raise pickle.PicklingError("logger cannot be pickled")
+                return logging.getLogger, (self.name,)
+
+            logging.Logger.__reduce__ = __reduce__
+
+        if self.log_config is not None:
+            if isinstance(self.log_config, dict):
+                if self.use_colors in (True, False):
+                    self.log_config["formatters"]["default"][
+                        "use_colors"
+                    ] = self.use_colors
+                    self.log_config["formatters"]["access"][
+                        "use_colors"
+                    ] = self.use_colors
+                logging.config.dictConfig(self.log_config)
+            else:
+                logging.config.fileConfig(self.log_config)
+
+        if self.log_level is not None:
+            if isinstance(self.log_level, str):
+                log_level = LOG_LEVELS[self.log_level]
+            else:
+                log_level = self.log_level
+            logging.getLogger("").setLevel(log_level)
+            logging.getLogger("uvicorn.error").setLevel(log_level)
+            logging.getLogger("uvicorn.access").setLevel(log_level)
+            logging.getLogger("uvicorn.asgi").setLevel(log_level)
+        if self.access_log is False:
+            logging.getLogger("uvicorn.access").handlers = []
+            logging.getLogger("uvicorn.access").propagate = False
 
     def load(self):
         assert not self.loaded
@@ -185,7 +287,7 @@ class Config:
         try:
             self.loaded_app = import_from_string(self.app)
         except ImportFromStringError as exc:
-            self.logger_instance.error("Error loading ASGI app. %s" % exc)
+            logger.error("Error loading ASGI app. %s" % exc)
             sys.exit(1)
 
         if self.interface == "auto":
@@ -206,29 +308,46 @@ class Config:
 
         if self.debug:
             self.loaded_app = DebugMiddleware(self.loaded_app)
-        if self.logger_instance.level <= logging.DEBUG:
+        if logger.level <= TRACE_LOG_LEVEL:
             self.loaded_app = MessageLoggerMiddleware(self.loaded_app)
         if self.proxy_headers:
-            self.loaded_app = ProxyHeadersMiddleware(self.loaded_app)
+            self.loaded_app = ProxyHeadersMiddleware(
+                self.loaded_app, trusted_hosts=self.forwarded_allow_ips
+            )
 
         self.loaded = True
 
     def setup_event_loop(self):
         loop_setup = import_from_string(LOOP_SETUPS[self.loop])
-        loop_setup()
+        if loop_setup is not None:
+            loop_setup()
 
     def bind_socket(self):
         sock = socket.socket()
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind((self.host, self.port))
+        try:
+            sock.bind((self.host, self.port))
+        except OSError as exc:
+            logger.error(exc)
+            sys.exit(1)
         sock.set_inheritable(True)
+
         message = "Uvicorn running on %s://%s:%d (Press CTRL+C to quit)"
+        color_message = (
+            "Uvicorn running on "
+            + click.style("%s://%s:%d", bold=True)
+            + " (Press CTRL+C to quit)"
+        )
         protocol_name = "https" if self.is_ssl else "http"
-        self.logger_instance.info(message % (protocol_name, self.host, self.port))
+        logger.info(
+            message,
+            protocol_name,
+            self.host,
+            self.port,
+            extra={"color_message": color_message},
+        )
         return sock
 
     @property
-    def logger_instance(self):
-        if self.logger is not None:
-            return self.logger
-        return get_logger(self.log_level)
+    def should_reload(self):
+        return isinstance(self.app, str) and (self.debug or self.reload)

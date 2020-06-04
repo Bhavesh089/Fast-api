@@ -6,6 +6,7 @@ PLACEHOLDER_FORMAT = {
     "text": "<{length} chars>",
     "headers": "<...>",
 }
+TRACE_LOG_LEVEL = 5
 
 
 def message_with_placeholders(message):
@@ -26,36 +27,42 @@ class MessageLoggerMiddleware:
     def __init__(self, app):
         self.task_counter = 0
         self.app = app
-        self.logger = logging.getLogger("uvicorn")
+        self.logger = logging.getLogger("uvicorn.asgi")
+
+        def trace(message, *args, **kwargs):
+            logging.log(TRACE_LOG_LEVEL, message, *args, **kwargs)
+
+        self.logger.trace = trace
 
     async def __call__(self, scope, receive, send):
         self.task_counter += 1
 
         task_counter = self.task_counter
-        client_addr = scope.get("client")
+        client = scope.get("client")
+        prefix = "%s:%d - ASGI" % (client[0], client[1]) if client else "ASGI"
 
         async def inner_receive():
-            nonlocal client_addr, receive, task_counter
             message = await receive()
             logged_message = message_with_placeholders(message)
-            log_text = "%s - ASGI [%d] Sent %s"
-            self.logger.debug(log_text, client_addr, task_counter, logged_message)
+            log_text = "%s [%d] Receive %s"
+            self.logger.trace(log_text, prefix, task_counter, logged_message)
             return message
 
         async def inner_send(message):
             logged_message = message_with_placeholders(message)
-            log_text = "%s - ASGI [%d] Received %s"
-            self.logger.debug(log_text, client_addr, task_counter, logged_message)
+            log_text = "%s [%d] Send %s"
+            self.logger.trace(log_text, prefix, task_counter, logged_message)
             await send(message)
 
-        log_text = "%s - ASGI [%d] Started"
-        self.logger.debug(log_text, client_addr, task_counter)
+        logged_scope = message_with_placeholders(scope)
+        log_text = "%s [%d] Started scope=%s"
+        self.logger.trace(log_text, prefix, task_counter, logged_scope)
         try:
             await self.app(scope, inner_receive, inner_send)
         except BaseException as exc:
-            log_text = "%s - ASGI [%d] Raised exception"
-            self.logger.debug(log_text, client_addr, task_counter)
+            log_text = "%s [%d] Raised exception"
+            self.logger.trace(log_text, prefix, task_counter)
             raise exc from None
         else:
-            log_text = "%s - ASGI [%d] Completed"
-            self.logger.debug(log_text, client_addr, task_counter)
+            log_text = "%s [%d] Completed"
+            self.logger.trace(log_text, prefix, task_counter)

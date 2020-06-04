@@ -1,6 +1,8 @@
 import asyncio
 import functools
+import logging
 import os
+import platform
 import signal
 import socket
 import ssl
@@ -11,16 +13,17 @@ from email.utils import formatdate
 
 import click
 
+import uvicorn
 from uvicorn.config import (
     HTTP_PROTOCOLS,
     INTERFACES,
     LIFESPAN,
     LOG_LEVELS,
+    LOGGING_CONFIG,
     LOOP_SETUPS,
     SSL_PROTOCOL_VERSION,
     WS_PROTOCOLS,
     Config,
-    get_logger,
 )
 from uvicorn.supervisors import Multiprocess, StatReload
 
@@ -28,13 +31,30 @@ LEVEL_CHOICES = click.Choice(LOG_LEVELS.keys())
 HTTP_CHOICES = click.Choice(HTTP_PROTOCOLS.keys())
 WS_CHOICES = click.Choice(WS_PROTOCOLS.keys())
 LIFESPAN_CHOICES = click.Choice(LIFESPAN.keys())
-LOOP_CHOICES = click.Choice(LOOP_SETUPS.keys())
+LOOP_CHOICES = click.Choice([key for key in LOOP_SETUPS.keys() if key != "none"])
 INTERFACE_CHOICES = click.Choice(INTERFACES)
 
 HANDLED_SIGNALS = (
     signal.SIGINT,  # Unix signal 2. Sent by Ctrl+C.
     signal.SIGTERM,  # Unix signal 15. Sent by `kill <pid>`.
 )
+
+logger = logging.getLogger("uvicorn.error")
+
+
+def print_version(ctx, param, value):
+    if not value or ctx.resilient_parsing:
+        return
+    click.echo(
+        "Running uvicorn %s with %s %s on %s"
+        % (
+            uvicorn.__version__,
+            platform.python_implementation(),
+            platform.python_version(),
+            platform.system(),
+        )
+    )
+    ctx.exit()
 
 
 @click.command()
@@ -65,13 +85,13 @@ HANDLED_SIGNALS = (
     "--reload-dir",
     "reload_dirs",
     multiple=True,
-    help="Set reload directories explicitly, instead of using 'sys.path'.",
+    help="Set reload directories explicitly, instead of using the current working directory.",
 )
 @click.option(
     "--workers",
-    default=1,
+    default=None,
     type=int,
-    help="Number of worker processes. Not valid with --reload.",
+    help="Number of worker processes. Defaults to the $WEB_CONCURRENCY environment variable if available. Not valid with --reload.",
 )
 @click.option(
     "--loop",
@@ -109,20 +129,49 @@ HANDLED_SIGNALS = (
     show_default=True,
 )
 @click.option(
-    "--log-level",
-    type=LEVEL_CHOICES,
-    default="info",
-    help="Log level.",
+    "--env-file",
+    type=click.Path(exists=True),
+    default=None,
+    help="Environment configuration file.",
     show_default=True,
 )
 @click.option(
-    "--no-access-log", is_flag=True, default=False, help="Disable access log."
+    "--log-config",
+    type=click.Path(exists=True),
+    default=None,
+    help="Logging configuration file.",
+    show_default=True,
 )
 @click.option(
-    "--proxy-headers",
+    "--log-level",
+    type=LEVEL_CHOICES,
+    default=None,
+    help="Log level. [default: info]",
+    show_default=True,
+)
+@click.option(
+    "--access-log/--no-access-log",
     is_flag=True,
-    default=False,
-    help="Use X-Forwarded-Proto, X-Forwarded-For, X-Forwarded-Port to populate remote address info.",
+    default=True,
+    help="Enable/Disable access log.",
+)
+@click.option(
+    "--use-colors/--no-use-colors",
+    is_flag=True,
+    default=None,
+    help="Enable/Disable colorized logging.",
+)
+@click.option(
+    "--proxy-headers/--no-proxy-headers",
+    is_flag=True,
+    default=True,
+    help="Enable/Disable X-Forwarded-Proto, X-Forwarded-For, X-Forwarded-Port to populate remote address info.",
+)
+@click.option(
+    "--forwarded-allow-ips",
+    type=str,
+    default=None,
+    help="Comma seperated list of IPs to trust with proxy headers. Defaults to the $FORWARDED_ALLOW_IPS environment variable if available, or '127.0.0.1'.",
 )
 @click.option(
     "--root-path",
@@ -135,6 +184,12 @@ HANDLED_SIGNALS = (
     type=int,
     default=None,
     help="Maximum number of concurrent connections or tasks to allow, before issuing HTTP 503 responses.",
+)
+@click.option(
+    "--backlog",
+    type=int,
+    default=2048,
+    help="Maximum number of connections to hold in backlog",
 )
 @click.option(
     "--limit-max-requests",
@@ -193,6 +248,14 @@ HANDLED_SIGNALS = (
     multiple=True,
     help="Specify custom default HTTP response headers as a Name:Value pair",
 )
+@click.option(
+    "--version",
+    is_flag=True,
+    callback=print_version,
+    expose_value=False,
+    is_eager=True,
+    help="Display the uvicorn version and exit.",
+)
 def main(
     app,
     host: str,
@@ -208,11 +271,15 @@ def main(
     reload: bool,
     reload_dirs: typing.List[str],
     workers: int,
+    env_file: str,
+    log_config: str,
     log_level: str,
-    no_access_log: bool,
+    access_log: bool,
     proxy_headers: bool,
+    forwarded_allow_ips: str,
     root_path: str,
     limit_concurrency: int,
+    backlog: int,
     limit_max_requests: int,
     timeout_keep_alive: int,
     ssl_keyfile: str,
@@ -222,6 +289,7 @@ def main(
     ssl_ca_certs: str,
     ssl_ciphers: str,
     headers: typing.List[str],
+    use_colors: bool,
 ):
     sys.path.insert(0, ".")
 
@@ -235,16 +303,20 @@ def main(
         "http": http,
         "ws": ws,
         "lifespan": lifespan,
+        "env_file": env_file,
+        "log_config": LOGGING_CONFIG if log_config is None else log_config,
         "log_level": log_level,
-        "access_log": not no_access_log,
+        "access_log": access_log,
         "interface": interface,
         "debug": debug,
         "reload": reload,
         "reload_dirs": reload_dirs if reload_dirs else None,
         "workers": workers,
         "proxy_headers": proxy_headers,
+        "forwarded_allow_ips": forwarded_allow_ips,
         "root_path": root_path,
         "limit_concurrency": limit_concurrency,
+        "backlog": backlog,
         "limit_max_requests": limit_max_requests,
         "timeout_keep_alive": timeout_keep_alive,
         "ssl_keyfile": ssl_keyfile,
@@ -254,6 +326,7 @@ def main(
         "ssl_ca_certs": ssl_ca_certs,
         "ssl_ciphers": ssl_ciphers,
         "headers": list([header.split(":") for header in headers]),
+        "use_colors": use_colors,
     }
     run(**kwargs)
 
@@ -262,19 +335,21 @@ def run(app, **kwargs):
     config = Config(app, **kwargs)
     server = Server(config=config)
 
-    if config.reload and not isinstance(app, str):
-        config.logger_instance.warn(
-            "auto-reload only works when app is passed as an import string."
+    if (config.reload or config.workers > 1) and not isinstance(app, str):
+        logger = logging.getLogger("uvicorn.error")
+        logger.warn(
+            "You must pass the application as an import string to enable 'reload' or 'workers'."
         )
+        sys.exit(1)
 
-    if isinstance(app, str) and (config.debug or config.reload):
+    if config.should_reload:
         sock = config.bind_socket()
-        supervisor = StatReload(config)
-        supervisor.run(server.run, sockets=[sock])
+        supervisor = StatReload(config, target=server.run, sockets=[sock])
+        supervisor.run()
     elif config.workers > 1:
         sock = config.bind_socket()
-        supervisor = Multiprocess(config)
-        supervisor.run(server.run, sockets=[sock])
+        supervisor = Multiprocess(config, target=server.run, sockets=[sock])
+        supervisor.run()
     else:
         server.run()
 
@@ -301,38 +376,47 @@ class Server:
         self.force_exit = False
         self.last_notified = 0
 
-    def run(self, sockets=None, shutdown_servers=True):
+    def run(self, sockets=None):
         self.config.setup_event_loop()
         loop = asyncio.get_event_loop()
         loop.run_until_complete(self.serve(sockets=sockets))
 
-    async def serve(self, sockets=None, shutdown_servers=True):
+    async def serve(self, sockets=None):
         process_id = os.getpid()
 
         config = self.config
         if not config.loaded:
             config.load()
 
-        self.logger = config.logger_instance
         self.lifespan = config.lifespan_class(config)
 
         self.install_signal_handlers()
 
-        self.logger.info("Started server process [{}]".format(process_id))
+        message = "Started server process [%d]"
+        color_message = "Started server process [" + click.style("%d", fg="cyan") + "]"
+        logger.info(message, process_id, extra={"color_message": color_message})
+
         await self.startup(sockets=sockets)
         if self.should_exit:
             return
         await self.main_loop()
-        await self.shutdown(shutdown_servers=shutdown_servers)
-        self.logger.info("Finished server process [{}]".format(process_id))
+        await self.shutdown(sockets=sockets)
+
+        message = "Finished server process [%d]"
+        color_message = "Finished server process [" + click.style("%d", fg="cyan") + "]"
+        logger.info(
+            "Finished server process [%d]",
+            process_id,
+            extra={"color_message": color_message},
+        )
 
     async def startup(self, sockets=None):
-        config = self.config
-
         await self.lifespan.startup()
         if self.lifespan.should_exit:
             self.should_exit = True
             return
+
+        config = self.config
 
         create_protocol = functools.partial(
             config.http_protocol_class, config=config, server_state=self.server_state
@@ -346,7 +430,7 @@ class Server:
             self.servers = []
             for sock in sockets:
                 server = await loop.create_server(
-                    create_protocol, sock=sock, ssl=config.ssl
+                    create_protocol, sock=sock, ssl=config.ssl, backlog=config.backlog
                 )
                 self.servers.append(server)
 
@@ -354,10 +438,10 @@ class Server:
             # Use an existing socket, from a file descriptor.
             sock = socket.fromfd(config.fd, socket.AF_UNIX, socket.SOCK_STREAM)
             server = await loop.create_server(
-                create_protocol, sock=sock, ssl=config.ssl
+                create_protocol, sock=sock, ssl=config.ssl, backlog=config.backlog
             )
             message = "Uvicorn running on socket %s (Press CTRL+C to quit)"
-            self.logger.info(message % str(sock.getsockname()))
+            logger.info(message % str(sock.getsockname()))
             self.servers = [server]
 
         elif config.uds is not None:
@@ -365,20 +449,45 @@ class Server:
             uds_perms = 0o666
             if os.path.exists(config.uds):
                 uds_perms = os.stat(config.uds).st_mode
-            server = await loop.create_unix_server(create_protocol, path=config.uds)
+            server = await loop.create_unix_server(
+                create_protocol, path=config.uds, ssl=config.ssl, backlog=config.backlog
+            )
             os.chmod(config.uds, uds_perms)
             message = "Uvicorn running on unix socket %s (Press CTRL+C to quit)"
-            self.logger.info(message % config.uds)
+            logger.info(message % config.uds)
             self.servers = [server]
 
         else:
             # Standard case. Create a socket from a host/port pair.
-            server = await loop.create_server(
-                create_protocol, host=config.host, port=config.port, ssl=config.ssl
-            )
+            try:
+                server = await loop.create_server(
+                    create_protocol,
+                    host=config.host,
+                    port=config.port,
+                    ssl=config.ssl,
+                    backlog=config.backlog,
+                )
+            except OSError as exc:
+                logger.error(exc)
+                await self.lifespan.shutdown()
+                sys.exit(1)
+            port = config.port
+            if port == 0:
+                port = server.sockets[0].getsockname()[1]
             protocol_name = "https" if config.ssl else "http"
             message = "Uvicorn running on %s://%s:%d (Press CTRL+C to quit)"
-            self.logger.info(message % (protocol_name, config.host, config.port))
+            color_message = (
+                "Uvicorn running on "
+                + click.style("%s://%s:%d", bold=True)
+                + " (Press CTRL+C to quit)"
+            )
+            logger.info(
+                message,
+                protocol_name,
+                config.host,
+                port,
+                extra={"color_message": color_message},
+            )
             self.servers = [server]
 
         self.started = True
@@ -414,15 +523,16 @@ class Server:
             return self.server_state.total_requests >= self.config.limit_max_requests
         return False
 
-    async def shutdown(self, shutdown_servers=True):
-        self.logger.info("Shutting down")
+    async def shutdown(self, sockets=None):
+        logger.info("Shutting down")
 
         # Stop accepting new connections.
-        if shutdown_servers:
-            for server in self.servers:
-                server.close()
-            for server in self.servers:
-                await server.wait_closed()
+        for socket in sockets or []:
+            socket.close()
+        for server in self.servers:
+            server.close()
+        for server in self.servers:
+            await server.wait_closed()
 
         # Request shutdown on all existing connections.
         for connection in list(self.server_state.connections):
@@ -432,14 +542,14 @@ class Server:
         # Wait for existing connections to finish sending responses.
         if self.server_state.connections and not self.force_exit:
             msg = "Waiting for connections to close. (CTRL+C to force quit)"
-            self.logger.info(msg)
+            logger.info(msg)
             while self.server_state.connections and not self.force_exit:
                 await asyncio.sleep(0.1)
 
         # Wait for existing tasks to complete.
         if self.server_state.tasks and not self.force_exit:
             msg = "Waiting for background tasks to complete. (CTRL+C to force quit)"
-            self.logger.info(msg)
+            logger.info(msg)
             while self.server_state.tasks and not self.force_exit:
                 await asyncio.sleep(0.1)
 

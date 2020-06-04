@@ -1,76 +1,80 @@
-import multiprocessing
+import logging
 import os
 import signal
-import sys
-import time
+import threading
 from pathlib import Path
+
+import click
+
+from uvicorn.subprocess import get_subprocess
 
 HANDLED_SIGNALS = (
     signal.SIGINT,  # Unix signal 2. Sent by Ctrl+C.
     signal.SIGTERM,  # Unix signal 15. Sent by `kill <pid>`.
 )
 
+logger = logging.getLogger("uvicorn.error")
+
 
 class StatReload:
-    def __init__(self, config):
+    def __init__(self, config, target, sockets):
         self.config = config
-        self.should_exit = False
-        self.reload_count = 0
+        self.target = target
+        self.sockets = sockets
+        self.should_exit = threading.Event()
+        self.pid = os.getpid()
         self.mtimes = {}
 
-    def handle_exit(self, sig, frame):
-        self.should_exit = True
+    def signal_handler(self, sig, frame):
+        """
+        A signal handler that is registered with the parent process.
+        """
+        self.should_exit.set()
 
-    @staticmethod
-    def handle_fds(target, fd_stdin, **kwargs):
-        """Handle stdin in subprocess for pdb."""
-        if fd_stdin is not None:
-            sys.stdin = os.fdopen(fd_stdin)
-        target(**kwargs)
+    def run(self):
+        self.startup()
+        while not self.should_exit.wait(0.25):
+            if self.should_restart():
+                self.restart()
+        self.shutdown()
 
-    def run(self, target, *args, **kwargs):
-        pid = os.getpid()
-        logger = self.config.logger_instance
-
-        logger.info("Started reloader process [{}]".format(pid))
+    def startup(self):
+        message = "Started reloader process [{}]".format(str(self.pid))
+        color_message = "Started reloader process [{}]".format(
+            click.style(str(self.pid), fg="cyan", bold=True)
+        )
+        logger.info(message, extra={"color_message": color_message})
 
         for sig in HANDLED_SIGNALS:
-            signal.signal(sig, self.handle_exit)
+            signal.signal(sig, self.signal_handler)
 
-        def get_subprocess():
-            spawn = multiprocessing.get_context("spawn")
-            try:
-                fileno = sys.stdin.fileno()
-            except OSError:
-                fileno = None
+        self.process = get_subprocess(
+            config=self.config, target=self.target, sockets=self.sockets
+        )
+        self.process.start()
 
-            return spawn.Process(
-                target=self.handle_fds, args=(target, fileno), kwargs=kwargs
-            )
-
-        process = get_subprocess()
-        process.start()
-
-        while process.is_alive() and not self.should_exit:
-            time.sleep(0.3)
-            if self.should_restart():
-                self.clear()
-                os.kill(process.pid, signal.SIGTERM)
-                process.join()
-
-                process = get_subprocess()
-                process.start()
-                self.reload_count += 1
-
-        logger.info("Stopping reloader process [{}]".format(pid))
-
-    def clear(self):
+    def restart(self):
         self.mtimes = {}
+        os.kill(self.process.pid, signal.SIGTERM)
+        self.process.join()
+
+        self.process = get_subprocess(
+            config=self.config, target=self.target, sockets=self.sockets
+        )
+        self.process.start()
+
+    def shutdown(self):
+        self.process.join()
+        message = "Stopping reloader process [{}]".format(str(self.pid))
+        color_message = "Stopping reloader process [{}]".format(
+            click.style(str(self.pid), fg="cyan", bold=True)
+        )
+        logger.info(message, extra={"color_message": color_message})
 
     def should_restart(self):
         for filename in self.iter_py_files():
             try:
-                mtime = os.stat(filename).st_mtime
+                mtime = os.path.getmtime(filename)
             except OSError as exc:  # pragma: nocover
                 continue
 
@@ -83,7 +87,7 @@ class StatReload:
                 if Path.cwd() in Path(filename).parents:
                     display_path = os.path.normpath(os.path.relpath(filename))
                 message = "Detected file change in '%s'. Reloading..."
-                self.config.logger_instance.warning(message, display_path)
+                logger.warning(message, display_path)
                 return True
         return False
 
@@ -91,6 +95,5 @@ class StatReload:
         for reload_dir in self.config.reload_dirs:
             for subdir, dirs, files in os.walk(reload_dir):
                 for file in files:
-                    filepath = subdir + os.sep + file
-                    if filepath.endswith(".py"):
-                        yield filepath
+                    if file.endswith(".py"):
+                        yield subdir + os.sep + file

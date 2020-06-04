@@ -1,41 +1,63 @@
-import multiprocessing
+import logging
 import os
 import signal
-import time
+import threading
+
+import click
+
+from uvicorn.subprocess import get_subprocess
 
 HANDLED_SIGNALS = (
     signal.SIGINT,  # Unix signal 2. Sent by Ctrl+C.
     signal.SIGTERM,  # Unix signal 15. Sent by `kill <pid>`.
 )
 
+logger = logging.getLogger("uvicorn.error")
+
 
 class Multiprocess:
-    def __init__(self, config):
+    def __init__(self, config, target, sockets):
         self.config = config
-        self.workers = config.workers
-        self.should_exit = False
+        self.target = target
+        self.sockets = sockets
+        self.processes = []
+        self.should_exit = threading.Event()
+        self.pid = os.getpid()
 
-    def handle_exit(self, sig, frame):
-        self.should_exit = True
+    def signal_handler(self, sig, frame):
+        """
+        A signal handler that is registered with the parent process.
+        """
+        self.should_exit.set()
 
-    def run(self, target, *args, **kwargs):
-        pid = os.getpid()
-        logger = self.config.logger_instance
+    def run(self):
+        self.startup()
+        self.should_exit.wait()
+        self.shutdown()
 
-        logger.info("Started parent process [{}]".format(pid))
+    def startup(self):
+        message = "Started parent process [{}]".format(str(self.pid))
+        color_message = "Started parent process [{}]".format(
+            click.style(str(self.pid), fg="cyan", bold=True)
+        )
+        logger.info(message, extra={"color_message": color_message})
 
         for sig in HANDLED_SIGNALS:
-            signal.signal(sig, self.handle_exit)
+            signal.signal(sig, self.signal_handler)
 
-        processes = []
-        for idx in range(self.workers):
-            process = multiprocessing.Process(target=target, args=args, kwargs=kwargs)
+        for idx in range(self.config.workers):
+            process = get_subprocess(
+                config=self.config, target=self.target, sockets=self.sockets
+            )
             process.start()
-            processes.append(process)
+            self.processes.append(process)
 
-        while (
-            any([process.is_alive() for process in processes]) and not self.should_exit
-        ):
-            time.sleep(0.1)
+    def shutdown(self):
+        for process in self.processes:
+            process.join()
 
-        logger.info("Stopping parent process [{}]".format(pid))
+        message = "Stopping parent process [{}]".format(str(self.pid))
+        color_message = "Stopping parent process [{}]".format(
+            click.style(str(self.pid), fg="cyan", bold=True)
+        )
+        logger.info(message, extra={"color_message": color_message})
