@@ -18,4 +18,4 @@ def someMethod(body: dict):
 
 @app.get("/")
 def hello():
-    return {"message":"Hello TutLinks.com"}
+    return {"message":"How are you"}
