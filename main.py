@@ -19,7 +19,7 @@ def someMethod(body: dict):
 @app.get("/readingfile")
 def ReadingJson():
  with open('Response_data.json') as f:
-  data = json.load(f)
+    data = json.load(f)
     return data    
 
 @app.get("/")
