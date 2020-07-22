@@ -9,7 +9,7 @@ from pydantic import BaseModel
 app = FastAPI()
 
 
-@app.post("/body")
+@app.post("/")
 def someMethod(body: dict):
     fileName = 'Response_data.json'
     with open(fileName, "w+") as write_file:
@@ -22,6 +22,6 @@ def ReadingJson():
     data = json.load(f)
     return data    
 
-@app.get("/")
-def hello():
-    return {"message":"How are you"}
+@app.get("/body")
+def hello(code:str):
+    return {"message": code }
