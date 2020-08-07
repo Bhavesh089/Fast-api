@@ -11,6 +11,7 @@ app = FastAPI()
 
 @app.post("/")
 def someMethod(body: dict):
+    
     fileName = 'Response_data.json'
     with open(fileName, "w+") as write_file:
         json.dump(body,write_file)
@@ -24,4 +25,5 @@ def ReadingJson():
 
 @app.get("/body")
 def hello(code:str):
-    return {"message": code }
+    response = RedirectResponse(url="http://localhost:3000/auth/lazada/redirect?code="+code)
+    return response
