@@ -28,6 +28,4 @@ def ReadingJson():
 
 @app.get("/body")
 def hello(code: str):
-    response = RedirectResponse(
-        url="http://localhost:3000/auth/lazada/redirect?code="+code)
-    return response
+    return code
